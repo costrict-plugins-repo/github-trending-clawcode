@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "clawcode",
+  "description": "Turn Claude Code into a persistent agent — memory, personality, voice, messaging, and more.",
+  "owner": {
+    "name": "crisandrews"
+  },
+  "plugins": [
+    {
+      "name": "agent",
+      "description": "Turn Claude Code into a persistent agent — memory, personality, voice, messaging, and more.",
+      "category": "productivity",
+      "source": "./"
+    }
+  ]
+}

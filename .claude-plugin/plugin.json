@@ -1,0 +1,23 @@
+{
+  "name": "agent",
+  "displayName": "ClawCode",
+  "description": "Turn Claude Code into a persistent agent — memory, personality, voice, messaging, and more.",
+  "version": "1.8.0",
+  "author": {
+    "name": "Juan Cristobal Andrews",
+    "url": "https://github.com/crisandrews"
+  },
+  "homepage": "https://github.com/crisandrews/ClawCode#quick-setup",
+  "repository": "https://github.com/crisandrews/ClawCode",
+  "license": "MIT",
+  "keywords": [
+    "agent",
+    "personality",
+    "memory",
+    "openclaw",
+    "soul",
+    "dreaming",
+    "clawcode"
+  ],
+  "mcpServers": "./.mcp.json"
+}

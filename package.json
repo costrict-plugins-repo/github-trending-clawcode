@@ -1,0 +1,24 @@
+{
+  "name": "clawcode",
+  "version": "1.8.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "npm install --silent >/dev/null 2>&1; exec npx tsx server.ts",
+    "test": "npx tsx tests/service-generator-smoke.test.ts && npx tsx tests/scope-exec-gate.test.ts && npx tsx tests/scope-exec-gate-e2e.test.ts && npx tsx tests/scope-exec-gate-doctor.test.ts && npx tsx tests/scope-trust.test.ts && npx tsx tests/scope-trust-workspace.test.ts && npx tsx tests/scope-trust-legacy-hook.test.ts",
+    "build:hook": "node scripts/build-exec-gate-hook.mjs",
+    "test:live": "tsx --test scripts/live-*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "better-sqlite3": "^11.0.0",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^3.0.0"
+  }
+}

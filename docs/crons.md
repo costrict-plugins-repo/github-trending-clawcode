@@ -1,0 +1,228 @@
+# Cron persistence
+
+ClawCode maintains a workspace-level **cron registry** at `memory/crons.json`. It is the source of truth for every scheduled task the user wants alive across sessions.
+
+## Why this exists
+
+Claude Code's `CronCreate` tool creates in-memory scheduled tasks that **die when the session ends**. The tool description itself says so:
+
+> Jobs live only in this Claude session — nothing is written to disk, and the job is gone when Claude exits.
+
+The `durable: true` parameter promises `.claude/scheduled_tasks.json` persistence, but in practice it's a no-op — only a stale `.lock` file is left behind. This meant that heartbeat, dreaming, imported OpenClaw reminders, and ad-hoc "remind me in 2h" crons all silently disappeared between sessions.
+
+The registry + reconcile pattern solves this: every cron the user creates is tracked in `memory/crons.json`; at the start of every session, a hook calls `CronList` against the harness, sees what's missing, and recreates it.
+
+## User commands
+
+All via `/agent:crons` — but the skill **also auto-loads on natural-language requests** for any future-time commitment, in any conversation language and on any channel (CLI, WhatsApp, Telegram, etc.):
+
+- "recordame en 5 minutos comprar pan" / "remind me in 5 minutes to buy bread"
+- "avísame mañana a las 9" / "wake me up tomorrow at 9"
+- "todos los lunes a las 8 hazme acordar X" / "every Monday at 8 remind me X"
+- "cada 30 minutos chequeá Y" / "every 30 minutes check Y"
+
+| Command | What it does |
+|---|---|
+| `/agent:crons list` | Show all reminders with status (✅ alive, ⚠️ missing, ⏸ paused). |
+| `/agent:crons add` (or natural language) | Create a reminder. Persists across sessions. The agent calls `bin/cron-from.sh` for time math; never invents the cron expression. |
+| `/agent:crons delete <key|N>` | Remove with `AskUserQuestion` confirmation. |
+| `/agent:crons pause <key>` | Stop without deleting (registry entry kept). |
+| `/agent:crons resume <key>` | Re-enable a paused reminder. |
+| `/agent:crons reconcile` | Force a manual sync (same as SessionStart does automatically). |
+| `/agent:crons import` | Import OpenClaw crons from `~/.openclaw/cron/jobs.json`. |
+
+## Time arithmetic — `bin/cron-from.sh`
+
+Reminders coming from natural language ("in 3 minutes", "tomorrow at 9am", "every Monday") need to be turned into a 5-field cron expression. **The agent never does this math itself.** LLMs miscompute timezones inconsistently (sometimes UTC, sometimes local), and the cron daemon interprets expressions in the host's LOCAL time — a mismatch silently fires reminders 4+ hours late or never.
+
+The `bin/cron-from.sh` helper is the single source of truth. It:
+- Reads the host clock as epoch seconds (timezone-independent)
+- Reformats into cron fields using the host's local timezone
+- Returns single-line JSON: `{"cron": "...", "human_local": "...", "iso_local": "...", "epoch": ..., "recurring": ..., "kind": "..."}`
+
+| User intent | Helper call | Example output cron |
+|---|---|---|
+| "in 3 minutes" | `cron-from.sh relative 3 minutes` | `25 13 19 4 *` |
+| "in 2 hours" | `cron-from.sh relative 2 hours` | `25 15 19 4 *` |
+| "at 14:30" today | `cron-from.sh absolute "14:30"` | `30 14 19 4 *` (rolls to tomorrow if past) |
+| "tomorrow at 9am" | `cron-from.sh absolute "09:00" tomorrow` | `0 9 20 4 *` |
+| "every day at 8am" | `cron-from.sh recurring daily "08:00"` | `0 8 * * *` |
+| "every Monday at 9am" | `cron-from.sh recurring weekly mon "09:00"` | `0 9 * * 1` |
+| "every 30 minutes" | `cron-from.sh recurring every 30 minutes` | `*/30 * * * *` |
+| "every 2 hours" | `cron-from.sh recurring every 2 hours` | `0 */2 * * *` |
+
+The skill (`skills/crons/SKILL.md`) instructs the agent to map user intent to one of these calls and pass the helper's `.cron` output verbatim to `CronCreate`. The `.human_local` field is used for the user-facing confirmation, so the time the agent shows always matches what the daemon will actually fire.
+
+The helper supports BSD `date` (macOS) and GNU `date` (Linux) — detected at runtime. DST transitions are handled by the system tzdata.
+
+## Registry schema
+
+`memory/crons.json`:
+
+```jsonc
+{
+  "version": 1,
+  "updatedAt": "2026-04-13T15:00:00Z",
+  "migration": { "openclawOffered": false, "openclawAnsweredAt": null },
+  "audit": {
+    "at": "2026-04-13T15:00:00Z",
+    "expected": 5,
+    "alive": 5,
+    "orphaned": 0,
+    "relinked": 0,
+    "blocked": 0,
+    "unknown": 0,
+    "orphanKeys": [],
+    "blockedKeys": []
+  },
+  "entries": [
+    {
+      "key": "heartbeat-default",
+      "cron": "*/30 * * * *",
+      "prompt": "Run /agent:heartbeat",
+      "recurring": true,
+      "source": "default-heartbeat",
+      "note": "Default 30-min heartbeat",
+      "createdAt": "2026-04-13T15:00:00Z",
+      "lastSeenAlive": "2026-04-13T15:00:00Z",
+      "harnessTaskId": "abc12345",
+      "paused": false,
+      "tombstone": null,
+      "adoptedAt": null,
+      "targetEpoch": null
+    }
+  ]
+}
+```
+
+### Field reference
+
+| Field | Meaning |
+|---|---|
+| `key` | Stable logical ID. Defaults use fixed keys; OpenClaw uses `openclaw-<uuid>`; ad-hoc uses `harness-<taskId>`. |
+| `cron` | 5-field cron expression in local time. |
+| `prompt` | The prompt the cron will enqueue when it fires. |
+| `recurring` | `true` = fires every match; `false` = one-shot. |
+| `source` | Enum: `default-heartbeat`, `default-dreaming`, `openclaw-import`, `agent-onboarding`, `backlog-reminder`, `ad-hoc`, `user-manual`. |
+| `harnessTaskId` | The 8-hex ID assigned by Claude Code when the cron was created. Changes every reconcile. |
+| `lastSeenAlive` | Last time the reconcile flow confirmed this cron was alive in `CronList`. |
+| `paused` | `true` → skipped by reconcile until resumed. |
+| `tombstone` | ISO timestamp set when the user deletes the entry or `prune-expired` retires a fired one-shot. Non-null entries are skipped by reconcile (resurrection-proof). Kept indefinitely; `/agent:doctor` warns when tombstones are older than 30 days. |
+| `adoptedAt` | Non-null if the entry came from `adopt-unknown` (a cron that existed in harness but not in registry — e.g., hook crashed). |
+| `targetEpoch` | For one-shots: epoch seconds of the intended firing time, recorded at creation from `cron-from.sh`'s real date math (stamp line 3). `null` for recurring entries and for entries created before this field existed. This is what lets `prune-expired` retire fired one-shots safely — a 5-field cron carries no year, so date math alone cannot decide expiry. |
+
+Top-level `audit` (written by `writeback.sh audit`, absent until the first audit runs): the last mechanical CronList-vs-registry diff — `at`, `expected` (active entries), `alive`, `orphaned` (safe to auto-recreate), `relinked` (entries re-bound to a surviving harness id instead of recreated), `blocked` (entries with AMBIGUOUS live duplicates — never auto-recreated, surfaced for manual resolution), `unknown` (live harness crons not in the registry), `orphanKeys[]`, `blockedKeys[]`. This is what `/agent:doctor` reads offline to warn about reminders that are registered but not firing (issue #32's silent-orphan failure mode).
+
+## How it works
+
+### Components
+
+- **`bin/cron-from.sh`** — deterministic cron expression generator (see "Time arithmetic" above). Pure bash + jq; no LLM math. Single source of truth for converting natural-language times into cron expressions in host-local TZ.
+- **`skills/crons/writeback.sh`** — the sole writer to the registry. Subcommands: `seed-defaults`, `upsert`, `tombstone`, `set-alive`, `adopt-unknown`, `audit`, `pause`, `resume`, `migration-mark`, `prune-expired`. Atomic write (tmp-file + mv), lockfile-protected (`memory/.crons-lock/`). `set-alive` and `audit` also refresh the `.reconciling` marker mtime when the marker exists **and is still fresh (<10 min)**, so the hooks' bypass window slides as long as a reconcile keeps making real progress — a stale marker left by a crashed reconcile is never resurrected. `prune-expired` tombstones `recurring=false` entries whose `targetEpoch` already passed, and reports legacy date-shaped entries (no `targetEpoch`) as suspects without mutating them. `audit` is the mechanical completion check: it takes the FULL `CronList` output on stdin (strict parse; blank input or any unparseable line = exit 4, nothing persisted), refreshes `lastSeenAlive` for confirmed-alive entries, safely relinks an orphaned entry when exactly one unclaimed live cron matches its (cron, prompt, recurring) triple — the "CronCreate succeeded but set-alive never ran" case — and classifies the rest: `orphan` (no matching live cron; safe for callers to recreate) vs `blocked` (matching live duplicates exist but the link is ambiguous; callers must NEVER auto-recreate these — that would add a third copy — and must skip `adopt-unknown` while any exist). Persists the `.audit` summary and prints `orphan key=…` / `blocked key=…` lines plus `audit: alive=K/N orphaned=X relinked=L blocked=B unknown=M`.
+- **`hooks/reconcile-crons.sh`** — SessionStart. Seeds defaults, prunes expired one-shots (best-effort, never blocks the reconcile), cleans legacy `.crons-created`, detects migration need, emits a reconcile envelope for the agent to execute.
+- **`hooks/cron-posttool.sh`** — PostToolUse. Captures ad-hoc `CronCreate` (as `source: ad-hoc`) and tombstones on `CronDelete`. Also persists the helper's target epoch (stamp line 3) as `targetEpoch` when the stamp cron matches the created cron. Tolerant of v2.1.114 and legacy harness response formats. Suppressed when `memory/.reconciling` marker is fresh (prevents duplicates during reconcile / import batches).
+- **`hooks/cron-pretool.sh`** — PreToolUse. Gates `CronCreate` so the cron expression must come from a recent `bin/cron-from.sh` invocation. Reads `memory/.cron-last-stamp` (three lines: cron, epoch, target epoch; the gate consumes the first two), exits 2 with a pedagogical stderr message if the stamp is missing, stale (>120s), or its cron doesn't match `tool_input.cron` — every rejection also teaches the mid-reconcile recovery (re-touch the marker and retry). Same `.reconciling` bypass as the posttool hook — SessionStart reconcile replays crons from the registry and must not be gated.
+- **`skills/crons/SKILL.md`** — agent-facing dispatcher. Routes subcommand phrasings (and natural-language requests) to the right flow, calls `bin/cron-from.sh` for time math, then `CronCreate` / `CronDelete` as needed.
+
+### Session-start flow
+
+```
+1. hooks/reconcile-crons.sh (SessionStart)
+   a. Inject identity (SOUL/IDENTITY/USER)
+   b. writeback.sh seed-defaults  (idempotent if valid; quarantines+rebuilds if corrupt)
+   b2. writeback.sh prune-expired  (best-effort: tombstones one-shots whose
+       targetEpoch passed; reports legacy date-shaped suspects in the banner)
+   c. Remove legacy .crons-created marker
+   d. Detect migration (IMPORT_BACKLOG.md + ~/.openclaw/cron/jobs.json + unanswered)
+   e. touch memory/.reconciling  (recursion guard for PostToolUse)
+   f. Build reconcile envelope with EXPECTED entries; emit atomically
+
+2. Agent executes the envelope (audit-first; every count below is computed
+   mechanically by writeback.sh, never by the agent)
+   - ToolSearch → CronList → writeback.sh audit  (refresh lastSeenAlive,
+     relink survivors, print orphan keys; exit 4 = format drift → stop)
+   - CronCreate each remaining orphan key + writeback.sh set-alive (each
+     set-alive/audit refreshes the still-fresh .reconciling marker, so the
+     bypass window slides while the reconcile progresses; individual
+     failures don't abort the loop)
+   - CronList → audit again; retry the orphans once if needed
+   - adopt-unknown only if the audit saw unknown>0 AND blocked=0 (adopting
+     ambiguous duplicates would cement them), then one final audit
+   - print the last audit line verbatim as the completion summary; if
+     orphans or blocked entries remain, tell the user explicitly →
+     rm .reconciling
+   - The envelope is declared a SINGLE unit of work: an interleaved chat
+     reply must resume the pending steps in the same turn (issue #32 +
+     the 2026-06-09 mid-reconcile stall)
+   - If migration STEP 9 is present, agent calls AskUserQuestion and handles answer
+```
+
+### Ad-hoc capture flow
+
+```
+User: "remind me in 4 hours to exercise"
+  → Agent calls CronCreate(cron="...", prompt="...", durable=true)
+  → PostToolUse hook fires → cron-posttool.sh
+    - If memory/.reconciling is fresh (<10 min since last refresh): skip (we're reconciling)
+    - Else: parse task_id from response → upsert into registry as source=ad-hoc,
+      carrying targetEpoch from the stamp's line 3 (when the stamp cron matches)
+```
+
+### Failure modes (all non-blocking)
+
+| Failure | Behavior |
+|---|---|
+| `memory/crons.json` corrupt | Writeback quarantines to `.corrupt-<ts>` and rebuilds from defaults. |
+| `jq` not installed | Reconcile emits a degraded envelope with only the two defaults. |
+| CronCreate fails for one entry | Logged to `memory/crons-errors.jsonl`. Next reconcile retries. |
+| Hook itself errors | Exit 0 with a warning. Session start is never blocked. |
+| `CronList` format changes upstream | Regex parsers abort loudly (`harness shape drift`). `audit` is strict: ANY unparseable non-empty line (or blank input) is exit 4 with nothing persisted. `adopt-unknown` keeps its original zero-match guard: it aborts (exit 4) only when no line matched, and can partially adopt on mixed valid/malformed input — acceptable because adoption is additive and idempotent. |
+| Reconcile envelope partially executed (agent stalled, turn ended, per-entry failures) | `writeback.sh audit` is the mechanical completion check: the envelope re-audits after recreation and retries once; orphans that survive are persisted in `.audit`, surfaced to the user, warned about by `/agent:doctor`, and self-healed by the heartbeat's always-on cron-health step (every 30 min) — a long-running session no longer waits days for the next SessionStart. |
+| Two sessions on same workspace | The lock (`memory/.crons-lock/`) serializes individual registry writes only — it does NOT stop both sessions from reconciling and double-creating harness crons. Known limitation; a registry session-lease is the planned fix. |
+| Same cron + prompt re-inserted under a different key | `writeback.sh upsert` refuses with exit 5 and a pedagogical message pointing at the existing entry. Prevents the "hook captured as `harness-<id>` then manual upsert with custom key" duplicate pattern. `--source openclaw-import` is exempt (batch imports may carry repeated payloads). |
+| `CronCreate` called without a fresh `cron-from.sh` stamp | `hooks/cron-pretool.sh` blocks with exit 2 and a stderr message instructing the agent to run the helper. Covers the three failure modes of skipping the helper: no stamp at all, stamp stale (>120s), or stamp cron doesn't match `tool_input.cron`. Bypassed only when `memory/.reconciling` marker is fresh (<10 min since its last refresh). |
+| Reconcile outlives the 10-min marker (chat interleaved between batches) | `writeback.sh set-alive` refreshes the marker mtime on every recreated entry, so the bypass window slides with real progress. If it still expires, every pretool rejection teaches the recovery: re-touch `memory/.reconciling` and retry. Note the sliding window also extends PostToolUse capture suppression for ad-hoc creates issued mid-reconcile. |
+| One-shot reminder already fired | `prune-expired` (run by every SessionStart reconcile) tombstones `recurring=false` entries whose `targetEpoch` passed, so they stop being resurrected a year later. Legacy date-shaped entries without `targetEpoch` are only REPORTED as suspects in the banner — the year of a 5-field cron is ambiguous, so they are never auto-removed; the user verifies and runs `/agent:crons delete <key>`. Intentional annuals (created >7 days before their date) are not flagged. |
+
+## Harness assumptions (verified empirically 2026-04-13)
+
+Probed `CronCreate` / `CronList` / `CronDelete` schemas + live calls:
+
+1. **Full Cron\* tool surface:** exactly three tools exist — `CronCreate`, `CronList`, `CronDelete`.
+2. **`CronCreate` main description contradicts its `durable` parameter.** Main text says *"nothing is written to disk"*; the flag claims to persist. Empirical check confirms the main description is authoritative.
+3. **`CronCreate` response format:** `Scheduled <recurring|one-shot> job <8hex-id> (<cron-expr>). Session-only (not written to disk, dies when Claude exits). Auto-expires after 7 days. Use CronDelete to cancel sooner.`
+4. **`CronList` response format (text, one line per job):** `<8hex-id> — <cron-expr> (recurring|one-shot) [session-only|durable]: <prompt>`. Empty = the literal string `No scheduled jobs.`.
+5. **Task IDs are 8 hex chars** (~4B namespace).
+6. **`CronList` includes the full `prompt`** → adoption is lossless.
+7. **Recurring tasks auto-expire after 7 days** in the harness. Reconcile recreates them.
+
+## What the fix does NOT do
+
+- **Does not revive crons created before the fix was installed.** Pre-fix ad-hoc crons were never persisted anywhere — they can't be recovered. Users need to recreate them.
+- **Does not run crons while Claude Code is closed.** For 24/7, use `/agent:service install` (launchd/systemd wrapper).
+- **Does not bypass the 7-day harness auto-expiration.** Each session's reconcile recreates them, so effectively they always appear alive — but if a workspace goes untouched >7 days, the harness forgets them; the next session resurrects.
+
+## User-facing management
+
+### Doctor check
+
+`/agent:doctor` now reports on the registry, including the last persisted audit:
+
+```
+Cron registry · 5 active · 1 paused · 2 tombstoned · last audit 2026-06-11T16:10: 5/5 alive
+jq · jq available in PATH
+```
+
+If the last audit recorded orphans (registry says active, harness fires nothing — the issue #32 failure mode), doctor warns with the orphaned keys and points at `/agent:crons reconcile`, regardless of how old the audit is. If it recorded blocked entries (ambiguous live duplicates that auto-repair refuses to touch), doctor warns with those keys and points at `/agent:crons list` for manual resolution (link the right live id with `writeback.sh set-alive`, or `CronDelete` the extras). If stale tombstones (>30 days) are found, doctor flags a warn. This is informational: tombstoned entries are inert and deliberately kept (they are what makes deletion resurrection-proof). Nothing purges them automatically; remove them from `memory/crons.json` by hand only if the list bothers you.
+
+### Audit trail
+
+- `memory/crons-pending.jsonl` — one line per captured PostToolUse event (for debugging).
+- `memory/crons-errors.jsonl` — any writeback failures during reconcile.
+- `memory/crons.json.corrupt-<ts>` — quarantined bad registries (manual cleanup when safe).
+
+## Relation to other features
+
+- **Service / 24/7:** `/agent:service install` wraps Claude Code in launchd/systemd. With it, the REPL is always running, so crons fire on schedule. Without it, crons only fire while a REPL is open (as documented). Registry persistence solves a different problem (reminders surviving restarts) — the service is orthogonal.
+- **Heartbeat / dreaming:** the two built-in recurring tasks (`heartbeat-default` every 30 min, `dreaming-default` at 3 AM) are seeded automatically. User can pause/resume/delete them like any other reminder.
+- **Import flow (`/agent:import`):** Step B uses `writeback.sh seed-defaults`. Step D.5 and E.3 use `writeback.sh upsert` with explicit `--source openclaw-import` / `--source backlog-reminder` keys, and suppress PostToolUse via the `.reconciling` marker to avoid duplicate capture.

@@ -1,0 +1,39 @@
+node_modules/
+.clawcode-live/
+package-lock.json
+.claude/
+dev-tests/
+# tests/ is internal-only: NO new test files may ever be committed (paths
+# already tracked in git history stay tracked — gitignore does not affect
+# tracked files). Glob form (not trailing-slash dir) so git still descends.
+tests/*
+agent-config.json
+.qmd/
+.crons-created
+.session-reset-pending
+memory/.memory.sqlite
+memory/.memory.sqlite-wal
+memory/.memory.sqlite-shm
+memory/.memory.sqlite.bak.*
+memory/.execgate-shadow.jsonl
+memory/.execgate-shadow.jsonl.*
+memory/.dreams/
+memory/.scoped/
+**/memory/.scoped/
+memory/.crons-lock/
+memory/.reconciling
+memory/.cron-last-stamp
+memory/crons-errors.jsonl
+memory/crons-pending.jsonl
+memory/crons.json.corrupt-*
+DREAMS.md
+.DS_Store
+.env
+.env.local
+.env.*.local
+*.log
+*.swp
+*.swo
+*.bak
+.plans/
+ideas/
